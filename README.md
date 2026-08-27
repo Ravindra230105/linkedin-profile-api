@@ -2,11 +2,6 @@
 
 Takes a LinkedIn profile URL and returns the profile as JSON.
 
-```
-GET /api/profile?url=https://www.linkedin.com/in/john-doe
-GET /health
-```
-
 ## Setup
 
 ```
@@ -15,40 +10,30 @@ cp .env.example .env
 npm start
 ```
 
-`.env` needs two cookies from a logged-in LinkedIn session:
+`.env` needs two cookies from a logged-in LinkedIn session, both from
+DevTools > Application > Cookies on linkedin.com:
 
 ```
 LI_AT=AQEDAT...
 JSESSIONID=ajax:1234567890123456789
 ```
 
-Both come from DevTools > Application > Cookies on linkedin.com after logging in. `JSESSIONID`
-keeps its `ajax:` prefix but drop the surrounding quotes. Use a throwaway account, not your own.
+Keep the `ajax:` prefix on `JSESSIONID` but not the quotes around it. Use a throwaway account.
 
-## Layout
+## API
 
 ```
-src/
-  server.js                          starts the http listener
-  app.js                             express app, middleware, error handlers
-  config/index.js                    env
-  routes/index.js                    mounts the modules under /api
-  middlewares/errorHandler.js        notFound and the error responder
-  utils/apiError.js                  error carrying an http status code
-  services/voyagerService.js         talks to linkedin: headers, calls, status mapping
-  modules/profile/
-    profileRoutes.js
-    profileController.js             request in, json out
-    profileService.js                orchestrates the seven calls
-    profileMapper.js                 voyager entities -> our response
-    profileValidation.js             profile url -> publicId
+GET /health
+GET /api/profile?url=https://www.linkedin.com/in/john-doe
 ```
 
-Controllers do no work beyond calling the service and handing errors to `next`. The service knows
-the order the calls have to happen in but nothing about HTTP, and `voyagerService.js` is the only
-file that knows LinkedIn exists.
+Profile URLs copied from the browser carry `?trk=...&originalSubdomain=...`, so encode the
+parameter:
 
-## Response
+```
+curl --get http://localhost:3000/api/profile \
+  --data-urlencode "url=https://www.linkedin.com/in/john-doe"
+```
 
 ```json
 {
@@ -83,7 +68,7 @@ file that knows LinkedIn exists.
       "description": null
     }
   ],
-  "skills": ["Project Management", "Software Development"],
+  "skills": ["Node.js", "PostgreSQL"],
   "certifications": [
     {
       "name": "AWS Certified Developer",
@@ -101,45 +86,58 @@ file that knows LinkedIn exists.
 }
 ```
 
-An `endDate` of `null` on an experience or education entry means it is still current. Fields the
-profile doesn't have come back as `null`, and empty sections come back as `[]`.
+An `endDate` of `null` means the entry is still current. Missing fields are `null` and empty
+sections are `[]`. A certification's dates are its issue and expiry, so they are named `issuedOn`
+and `expiresOn` rather than start and end.
 
-A certification's dates are its issue and expiry date rather than a period worked, so they are
-named `issuedOn` and `expiresOn`. Language proficiency arrives as an enum
-(`FULL_PROFESSIONAL`) and is mapped to the label the profile page displays; an unrecognised
-value passes through unchanged.
+Errors are `{ "error": "..." }` with a 400 for a url that is not a LinkedIn profile, 404 when the
+profile does not resolve, and 502 when LinkedIn rejects or blocks the call.
 
-Errors are `{ "error": "..." }` with a 400 for a URL that isn't a LinkedIn profile, 404 when the
-profile doesn't resolve, and 502 when LinkedIn rejects, blocks or challenges the call.
+## Layout
+
+```
+src/
+  server.js                     starts the listener
+  app.js                        express app and error handlers
+  config/index.js
+  routes/index.js               mounts modules under /api
+  middlewares/errorHandler.js
+  utils/apiError.js
+  services/voyagerService.js    the only file that talks to linkedin
+  modules/profile/
+    profileRoutes.js
+    profileController.js
+    profileService.js           orders the calls
+    profileMapper.js            linkedin entities -> our response
+    profileValidation.js        profile url -> publicId
+```
 
 ## Approach
 
-LinkedIn's public API can't do this. Sign In with LinkedIn returns a name and an avatar for the
-user who just logged in, and there is no self-serve endpoint that returns an arbitrary third
-party's profile - that sits behind their partner programs.
+LinkedIn's public API cannot do this. Sign In with LinkedIn returns a name and an avatar for the
+user who just logged in, and there is no self-serve endpoint that returns someone else's profile.
+That sits behind their partner programs.
 
-So this talks to Voyager, the internal API that linkedin.com's own web app calls, carrying the
-session cookies as request headers. No browser or headless browser is involved.
+So this uses Voyager, the internal API that linkedin.com's own web app calls, sending the session
+cookies as request headers. No browser or headless browser is involved.
 
-Voyager exposes three generations of endpoint side by side: the legacy REST routes, the newer
-"dash" REST routes, and GraphQL. I went looking at all three:
+Voyager runs three generations of endpoint side by side, and I tested all three before picking one:
 
-- `/identity/profiles/{publicId}/profileView`, the old single call that returned a whole
-  profile, now answers **410 Gone**.
-- The GraphQL route works but only accepts pre-registered queries, identified by a hash that
-  changes with every client release (`queryId=voyagerIdentityDashProfiles.<32 hex chars>`).
-  Building on it means re-harvesting hashes from the web client whenever they rotate.
-- The **dash REST routes still work undecorated**, and that's what this uses. They return typed
-  entities with real field names, need no query hash, and have nothing in them that expires.
+- `/identity/profiles/{publicId}/profileView`, the old call that returned a whole profile in one
+  hit, now answers 410 Gone.
+- GraphQL works, but only accepts queries LinkedIn has pre-registered, identified by a hash that
+  changes with each client release. Building on it means re-harvesting hashes whenever they rotate.
+- The dash REST routes still answer undecorated, with no hash involved, and return typed entities
+  with real field names. That is what this uses.
 
 Seven calls make up one profile:
 
 ```
 /identity/dash/profiles?q=memberIdentity&memberIdentity=<publicId>
-    -> the full Profile entity: names, headline, about, images, and the profile urn
+    the Profile entity: names, headline, about, images, and the profile urn
 
 /identity/dash/profiles?q=memberIdentity&memberIdentity=<publicId>&decorationId=<WebTopCardCore-6>
-    -> the same lookup decorated, which is what resolves the location urn to a place name
+    the same lookup decorated, which resolves the location urn to a place name
 
 /identity/dash/profilePositions?q=viewee&profileUrn=<urn>
 /identity/dash/profileEducations?q=viewee&profileUrn=<urn>
@@ -148,38 +146,39 @@ Seven calls make up one profile:
 /identity/dash/profileLanguages?q=viewee&profileUrn=<urn>
 ```
 
-The two profile lookups run together; the five section calls then run together once the urn is
-known, since each one needs it.
+The two profile lookups run together. The five section calls need the urn the first one returns,
+so they wait for it and then run together too.
 
-Responses use `application/vnd.linkedin.normalized+json+2.1`: entities are deduplicated into a
-flat `included` array and `data["*elements"]` lists their urns in display order. `parse.js` reads
-that order rather than `included` directly, so experience and education come back newest first
-the way the profile page shows them. Images are vector images - a `rootUrl` plus artifacts that
-are *not* sorted by size, so the largest is chosen by width rather than by position.
+Two details about the responses shaped `profileMapper.js`. Entities are deduplicated into a flat
+`included` array while `data["*elements"]` holds their urns in display order, so the mapper reads
+that order instead of `included` directly and experience comes back newest first. And profile
+images are a `rootUrl` plus artifacts that are not sorted by size, so the largest one is picked by
+width rather than by position.
 
-Login is done by hand, once. LinkedIn challenges non-browser login attempts with CAPTCHA and
-email verification, so automating it would add risk without adding capability. The cookies are
-harvested from a browser session and treated as configuration.
+The `csrf-token` header has to match the `JSESSIONID` cookie exactly or every call comes back 403
+with an empty body.
+
+Logging in is done by hand, once. LinkedIn answers non-browser login attempts with CAPTCHA and
+email verification, so automating it adds risk without adding anything. The cookies are treated as
+configuration.
 
 ## Known limitations
 
-Voyager returns what the signed-in account is allowed to see. Public figures and out-of-network
-profiles do resolve, but a profile that has restricted its visibility will come back thinner.
-This is a property of the approach rather than a bug in the code.
+Voyager returns what the signed-in account can see. Public figures and out-of-network profiles do
+resolve, but a profile that has restricted its visibility comes back thinner.
 
-Sections that a profile hasn't filled in return an empty array, which is indistinguishable from a
-section that exists but isn't visible to this session.
+A section nobody filled in and a section this session cannot see both return `[]`.
 
-Only the five sections named in the response above are read. Projects, publications, volunteering
-and honours have their own dash finders and would follow the same pattern.
+Only the five sections above are read. Projects, publications, volunteering and honours have their
+own dash finders and would follow the same pattern.
 
-LinkedIn blocks datacenter IP ranges. The same cookies that work locally can be met with a 429 or
-a challenge page from a cloud host, which surfaces as a 502. Routing outbound traffic through a
-proxy via `HTTPS_PROXY` is the workaround. Below the HTTP layer, TLS fingerprinting can also
-distinguish Node's handshake from Chrome's regardless of the headers.
+LinkedIn blocks datacenter IP ranges, so the cookies that work locally can be met with a 429 or a
+challenge page from a cloud host, which surfaces as a 502. An outbound proxy via `HTTPS_PROXY` is
+the workaround. Below the HTTP layer, TLS fingerprinting can tell Node's handshake from Chrome's
+regardless of the headers.
 
-Sessions expire. When `LI_AT` goes stale the API returns 502 saying so, and the cookies have to
-be harvested again.
+Sessions expire. When `LI_AT` goes stale every call returns 502 and the cookies have to be
+harvested again.
 
-Scraping LinkedIn this way is against their User Agreement and the account holding the session
-can be restricted, which is why this runs on a throwaway account.
+Reading LinkedIn this way is against their User Agreement and the account holding the session can
+be restricted, so it should not be an account you care about.
