@@ -165,4 +165,3 @@ a script, so I take the cookies from the browser and keep them in `.env`.
 - LinkedIn blocks cloud IPs, so a deployed instance can get blocked where localhost works. Setting
   `HTTPS_PROXY` is the way around it.
 - cookies expire, and after that every call returns 502 until you replace them
-- this is against LinkedIn's terms and the account can get restricted, so use a throwaway one
